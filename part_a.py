@@ -55,6 +55,10 @@ class SearchState:
 
     roster: list[list[Optional[Shift]]]
     domains: list[list[set[Shift]]]
+    domain_buckets: list[set[Variable]]
+    morning_candidates: list[set[int]]
+    afternoon_candidates: list[set[int]]
+    evening_candidates: list[set[int]]
 
     # Current coverage contributed by assigned cells on each day.
     morning_coverage: list[int]
@@ -142,12 +146,32 @@ def initial_domain(problem: Problem, nurse: int, day: int) -> set[Shift]:
 
 def build_initial_state(problem: Problem) -> SearchState:
     """Create an empty roster and its initial domains/counters."""
+    domains = [
+        [initial_domain(problem, nurse, day) for day in range(problem.D)]
+        for nurse in range(problem.N)
+    ]
+    domain_buckets: list[set[Variable]] = [set() for _ in range(6)]
+    morning_candidates = [set() for _ in range(problem.D)]
+    afternoon_candidates = [set() for _ in range(problem.D)]
+    evening_candidates = [set() for _ in range(problem.D)]
+
+    for nurse in range(problem.N):
+        for day in range(problem.D):
+            domain_buckets[len(domains[nurse][day])].add((nurse, day))
+            if domains[nurse][day] & {"M", "B"}:
+                morning_candidates[day].add(nurse)
+            if domains[nurse][day] & {"A", "B"}:
+                afternoon_candidates[day].add(nurse)
+            if "E" in domains[nurse][day]:
+                evening_candidates[day].add(nurse)
+
     return SearchState(
         roster=[[None for _ in range(problem.D)] for _ in range(problem.N)],
-        domains=[
-            [initial_domain(problem, nurse, day) for day in range(problem.D)]
-            for nurse in range(problem.N)
-        ],
+        domains=domains,
+        domain_buckets=domain_buckets,
+        morning_candidates=morning_candidates,
+        afternoon_candidates=afternoon_candidates,
+        evening_candidates=evening_candidates,
         morning_coverage=[0] * problem.D,
         afternoon_coverage=[0] * problem.D,
         evening_coverage=[0] * problem.D,
@@ -164,6 +188,34 @@ def shift_load(shift: Shift) -> int:
     if shift == "R":
         return 0
     return 1
+
+
+def update_coverage_candidates(
+    state: SearchState, nurse: int, day: int
+) -> None:
+    """Synchronize one cell with the three daily coverage-candidate sets."""
+    if state.roster[nurse][day] is not None:
+        state.morning_candidates[day].discard(nurse)
+        state.afternoon_candidates[day].discard(nurse)
+        state.evening_candidates[day].discard(nurse)
+        return
+
+    domain = state.domains[nurse][day]
+
+    if domain & {"M", "B"}:
+        state.morning_candidates[day].add(nurse)
+    else:
+        state.morning_candidates[day].discard(nurse)
+
+    if domain & {"A", "B"}:
+        state.afternoon_candidates[day].add(nurse)
+    else:
+        state.afternoon_candidates[day].discard(nurse)
+
+    if "E" in domain:
+        state.evening_candidates[day].add(nurse)
+    else:
+        state.evening_candidates[day].discard(nurse)
 
 
 def basic_feasibility_checks(p: Problem) -> bool:
@@ -205,18 +257,10 @@ def select_unassigned_variable(
     problem: Problem, state: SearchState
 ) -> Optional[Variable]:
     """Choose an unassigned cell using minimum remaining values."""
-    selected: Optional[Variable] = None
-    smallest_domain = 6
-
-    for nurse in range(problem.N):
-        for day in range(problem.D):
-            if state.roster[nurse][day] is None:
-                domain_size = len(state.domains[nurse][day])
-                if domain_size < smallest_domain:
-                    smallest_domain = domain_size
-                    selected = (nurse, day)
-
-    return selected
+    for bucket in state.domain_buckets:
+        if bucket:
+            return next(iter(bucket))
+    return None
 
 
 def order_domain_values(
@@ -322,7 +366,9 @@ def assign(state: SearchState, nurse: int, day: int, shift: Shift) -> None:
     if state.roster[nurse][day] is not None:
         raise ValueError("attempted to assign an already assigned cell")
 
+    state.domain_buckets[len(state.domains[nurse][day])].remove((nurse, day))
     state.roster[nurse][day] = shift
+    update_coverage_candidates(state, nurse, day)
     if shift in {"M", "B"}:
         state.morning_coverage[day] += 1
     if shift in {"A", "B"}:
@@ -349,6 +395,8 @@ def unassign(state: SearchState, nurse: int, day: int, shift: Shift) -> None:
     state.unassigned_on_day[day] += 1
     state.nurse_shift_load[nurse] -= shift_load(shift)
     state.unassigned_count += 1
+    state.domain_buckets[len(state.domains[nurse][day])].add((nurse, day))
+    update_coverage_candidates(state, nurse, day)
 
 
 def forward_check(
@@ -364,14 +412,21 @@ def forward_check(
     when any unassigned variable loses its entire domain.
     """
     changes: list[DomainChange] = []
+    dirty_days = {day}
 
     def remove_values(target_nurse: int, target_day: int, values: set[Shift]) -> None:
         if state.roster[target_nurse][target_day] is not None:
             return
         for value in values:
             if value in state.domains[target_nurse][target_day]:
+                old_size = len(state.domains[target_nurse][target_day])
+                cell = (target_nurse, target_day)
+                state.domain_buckets[old_size].remove(cell)
                 state.domains[target_nurse][target_day].remove(value)
+                state.domain_buckets[old_size - 1].add(cell)
+                update_coverage_candidates(state, target_nurse, target_day)
                 changes.append((target_nurse, target_day, value))
+                dirty_days.add(target_day)
 
     # H2, H3, H6: prune the previous and next day for this nurse.
     if day > 0:
@@ -387,18 +442,6 @@ def forward_check(
             remove_values(nurse, day + 1, {"M", "B"})
         elif shift == "B":
             remove_values(nurse, day + 1, {"M", "A", "B"})
-
-    # H4: once a daily coverage target is full, no unassigned nurse may
-    # contribute to that target.
-    for other_nurse in range(problem.N):
-        if state.roster[other_nurse][day] is not None:
-            continue
-        if state.morning_coverage[day] == problem.morning_required:
-            remove_values(other_nurse, day, {"M", "B"})
-        if state.afternoon_coverage[day] == problem.afternoon_required:
-            remove_values(other_nurse, day, {"A", "B"})
-        if state.evening_coverage[day] == problem.evening_required:
-            remove_values(other_nurse, day, {"E"})
 
     # H7: if an uncovered surgical day has only one unassigned surgical
     # nurse left, that nurse must take B.
@@ -438,16 +481,63 @@ def forward_check(
             if start + 5 < problem.D:
                 remove_values(nurse, start + 5, {"M", "A", "E", "B"})
 
+    # H4: process only days whose candidate sets changed. Domain removals on
+    # a day add that day back to the worklist, allowing forced values to
+    # propagate until no affected day remains.
+    while dirty_days:
+        target_day = dirty_days.pop()
+
+        morning_needed = (
+            problem.morning_required - state.morning_coverage[target_day]
+        )
+        afternoon_needed = (
+            problem.afternoon_required - state.afternoon_coverage[target_day]
+        )
+        evening_needed = (
+            problem.evening_required - state.evening_coverage[target_day]
+        )
+
+        if (
+            morning_needed < 0
+            or afternoon_needed < 0
+            or evening_needed < 0
+            or len(state.morning_candidates[target_day]) < morning_needed
+            or len(state.afternoon_candidates[target_day]) < afternoon_needed
+            or len(state.evening_candidates[target_day]) < evening_needed
+        ):
+            restore_domains(state, changes)
+            return None
+
+        if morning_needed == 0:
+            for candidate in list(state.morning_candidates[target_day]):
+                remove_values(candidate, target_day, {"M", "B"})
+        elif len(state.morning_candidates[target_day]) == morning_needed:
+            for candidate in list(state.morning_candidates[target_day]):
+                remove_values(candidate, target_day, {"A", "E", "R"})
+
+        if afternoon_needed == 0:
+            for candidate in list(state.afternoon_candidates[target_day]):
+                remove_values(candidate, target_day, {"A", "B"})
+        elif len(state.afternoon_candidates[target_day]) == afternoon_needed:
+            for candidate in list(state.afternoon_candidates[target_day]):
+                remove_values(candidate, target_day, {"M", "E", "R"})
+
+        if evening_needed == 0:
+            for candidate in list(state.evening_candidates[target_day]):
+                remove_values(candidate, target_day, {"E"})
+        elif len(state.evening_candidates[target_day]) == evening_needed:
+            for candidate in list(state.evening_candidates[target_day]):
+                remove_values(candidate, target_day, {"M", "A", "B", "R"})
+
+        if state.domain_buckets[0]:
+            restore_domains(state, changes)
+            return None
+
     # A failed propagation must restore its own removals because None does
     # not carry a trail back to the caller.
-    for target_nurse in range(problem.N):
-        for target_day in range(problem.D):
-            if (
-                state.roster[target_nurse][target_day] is None
-                and not state.domains[target_nurse][target_day]
-            ):
-                restore_domains(state, changes)
-                return None
+    if state.domain_buckets[0]:
+        restore_domains(state, changes)
+        return None
 
     return changes
 
@@ -455,7 +545,12 @@ def forward_check(
 def restore_domains(state: SearchState, changes: list[DomainChange]) -> None:
     """Undo domain removals in reverse order."""
     for nurse, day, shift in reversed(changes):
+        old_size = len(state.domains[nurse][day])
+        cell = (nurse, day)
+        state.domain_buckets[old_size].remove(cell)
         state.domains[nurse][day].add(shift)
+        state.domain_buckets[old_size + 1].add(cell)
+        update_coverage_candidates(state, nurse, day)
 
 
 def final_constraints_hold(problem: Problem, state: SearchState) -> bool:
