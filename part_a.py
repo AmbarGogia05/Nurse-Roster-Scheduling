@@ -15,12 +15,13 @@ import json
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 
 Shift = str
 Variable = tuple[int, int]
 DomainChange = tuple[int, int, Shift]
+ValueScorer = Callable[["Problem", "SearchState", int, int, Shift], float]
 
 
 @dataclass(frozen=True)
@@ -59,11 +60,13 @@ class SearchState:
     morning_candidates: list[set[int]]
     afternoon_candidates: list[set[int]]
     evening_candidates: list[set[int]]
+    surgery_candidates: list[set[int]]
 
     # Current coverage contributed by assigned cells on each day.
     morning_coverage: list[int]
     afternoon_coverage: list[int]
     evening_coverage: list[int]
+    surgery_coverage: list[int]
     unassigned_on_day: list[int]
 
     # H8 counts shift slots: B contributes two, all other work shifts one.
@@ -154,6 +157,7 @@ def build_initial_state(problem: Problem) -> SearchState:
     morning_candidates = [set() for _ in range(problem.D)]
     afternoon_candidates = [set() for _ in range(problem.D)]
     evening_candidates = [set() for _ in range(problem.D)]
+    surgery_candidates = [set() for _ in range(problem.D)]
 
     for nurse in range(problem.N):
         for day in range(problem.D):
@@ -164,6 +168,8 @@ def build_initial_state(problem: Problem) -> SearchState:
                 afternoon_candidates[day].add(nurse)
             if "E" in domains[nurse][day]:
                 evening_candidates[day].add(nurse)
+            if "B" in domains[nurse][day]:
+                surgery_candidates[day].add(nurse)
 
     return SearchState(
         roster=[[None for _ in range(problem.D)] for _ in range(problem.N)],
@@ -172,9 +178,11 @@ def build_initial_state(problem: Problem) -> SearchState:
         morning_candidates=morning_candidates,
         afternoon_candidates=afternoon_candidates,
         evening_candidates=evening_candidates,
+        surgery_candidates=surgery_candidates,
         morning_coverage=[0] * problem.D,
         afternoon_coverage=[0] * problem.D,
         evening_coverage=[0] * problem.D,
+        surgery_coverage=[0] * problem.D,
         unassigned_on_day=[problem.N] * problem.D,
         nurse_shift_load=[0] * problem.N,
         unassigned_count=problem.N * problem.D,
@@ -198,6 +206,7 @@ def update_coverage_candidates(
         state.morning_candidates[day].discard(nurse)
         state.afternoon_candidates[day].discard(nurse)
         state.evening_candidates[day].discard(nurse)
+        state.surgery_candidates[day].discard(nurse)
         return
 
     domain = state.domains[nurse][day]
@@ -216,6 +225,11 @@ def update_coverage_candidates(
         state.evening_candidates[day].add(nurse)
     else:
         state.evening_candidates[day].discard(nurse)
+
+    if "B" in domain:
+        state.surgery_candidates[day].add(nurse)
+    else:
+        state.surgery_candidates[day].discard(nurse)
 
 
 def basic_feasibility_checks(p: Problem) -> bool:
@@ -263,12 +277,89 @@ def select_unassigned_variable(
     return None
 
 
+def score_domain_value(
+    problem: Problem,
+    state: SearchState,
+    nurse: int,
+    day: int,
+    shift: Shift,
+) -> float:
+    """Estimate how restrictive a value is without modifying the state."""
+    score = 0
+
+    # Count the values this choice would remove from adjacent-day domains.
+    if day > 0 and state.roster[nurse][day - 1] is None:
+        if shift in {"M", "B"}:
+            score += len(state.domains[nurse][day - 1] & {"M", "B", "E"})
+        elif shift == "A":
+            score += int("B" in state.domains[nurse][day - 1])
+
+    if day + 1 < problem.D and state.roster[nurse][day + 1] is None:
+        if shift in {"M", "E"}:
+            score += len(state.domains[nurse][day + 1] & {"M", "B"})
+        elif shift == "B":
+            score += len(state.domains[nurse][day + 1] & {"M", "A", "B"})
+
+    # Penalize consuming a candidate from a coverage requirement that has
+    # little slack. A value that provides the coverage does not consume it.
+    def slack_penalty(candidate_count: int, needed: int) -> int:
+        if needed <= 0:
+            return 0
+        slack = candidate_count - needed
+        if slack <= 0:
+            return 0
+        if slack == 1:
+            return 5
+        if slack == 2:
+            return 2
+        return 0
+
+    morning_needed = problem.morning_required - state.morning_coverage[day]
+    if shift not in {"M", "B"} and nurse in state.morning_candidates[day]:
+        score += slack_penalty(
+            len(state.morning_candidates[day]), morning_needed
+        )
+
+    afternoon_needed = (
+        problem.afternoon_required - state.afternoon_coverage[day]
+    )
+    if shift not in {"A", "B"} and nurse in state.afternoon_candidates[day]:
+        score += slack_penalty(
+            len(state.afternoon_candidates[day]), afternoon_needed
+        )
+
+    evening_needed = problem.evening_required - state.evening_coverage[day]
+    if shift != "E" and nurse in state.evening_candidates[day]:
+        score += slack_penalty(
+            len(state.evening_candidates[day]), evening_needed
+        )
+
+    # Reaching K forces every remaining day for this nurse to R.
+    if (
+        shift != "R"
+        and state.nurse_shift_load[nurse] + shift_load(shift)
+        == problem.max_shifts
+    ):
+        score += 5
+
+    # Prefer satisfying an uncovered surgical day with B.
+    if shift == "B" and problem.is_surgical_day(day):
+        if state.surgery_coverage[day] == 0:
+            score -= 5
+
+    return score
+
+
 def order_domain_values(
-    problem: Problem, state: SearchState, nurse: int, day: int
+    problem: Problem,
+    state: SearchState,
+    nurse: int,
+    day: int,
+    scorer: ValueScorer = score_domain_value,
 ) -> list[Shift]:
-    """Order consistent values by the number of domain values they remove."""
+    """Order consistent values using the supplied estimated-cost function."""
     shift_order = ("M", "A", "E", "R", "B")
-    scored_values: list[tuple[int, int, Shift]] = []
+    scored_values: list[tuple[float, int, Shift]] = []
 
     for order, shift in enumerate(shift_order):
         if shift not in state.domains[nurse][day]:
@@ -276,14 +367,8 @@ def order_domain_values(
         if not is_consistent(problem, state, nurse, day, shift):
             continue
 
-        assign(state, nurse, day, shift)
-        changes = forward_check(problem, state, nurse, day, shift)
-
-        if changes is not None:
-            scored_values.append((len(changes), order, shift))
-            restore_domains(state, changes)
-
-        unassign(state, nurse, day, shift)
+        score = scorer(problem, state, nurse, day, shift)
+        scored_values.append((score, order, shift))
 
     scored_values.sort()
     return [shift for _, _, shift in scored_values]
@@ -342,17 +427,12 @@ def is_consistent(
     # check for H6 is also based on domain removal, and is covered above
     # partial check for H7
     if problem.is_surgical_nurse(nurse) and problem.is_surgical_day(day):
-        has_surgery_shift = any(
-            state.roster[surgical_nurse][day] == "B"
-            for surgical_nurse in range(problem.Ns)
-        )
-        if not has_surgery_shift:
-            unassigned_surgical_nurses = sum(
-                state.roster[surgical_nurse][day] is None
-                for surgical_nurse in range(problem.Ns)
-            )
-            if unassigned_surgical_nurses == 1 and shift != "B":
-                return False
+        if (
+            state.surgery_coverage[day] == 0
+            and state.surgery_candidates[day] == {nurse}
+            and shift != "B"
+        ):
+            return False
 
     # check for H8
     if state.nurse_shift_load[nurse] + shift_load(shift) > problem.max_shifts:
@@ -375,6 +455,8 @@ def assign(state: SearchState, nurse: int, day: int, shift: Shift) -> None:
         state.afternoon_coverage[day] += 1
     if shift == "E":
         state.evening_coverage[day] += 1
+    if shift == "B":
+        state.surgery_coverage[day] += 1
     state.unassigned_on_day[day] -= 1
     state.nurse_shift_load[nurse] += shift_load(shift)
     state.unassigned_count -= 1
@@ -392,6 +474,8 @@ def unassign(state: SearchState, nurse: int, day: int, shift: Shift) -> None:
         state.afternoon_coverage[day] -= 1
     if shift == "E":
         state.evening_coverage[day] -= 1
+    if shift == "B":
+        state.surgery_coverage[day] -= 1
     state.unassigned_on_day[day] += 1
     state.nurse_shift_load[nurse] -= shift_load(shift)
     state.unassigned_count += 1
@@ -443,27 +527,6 @@ def forward_check(
         elif shift == "B":
             remove_values(nurse, day + 1, {"M", "A", "B"})
 
-    # H7: if an uncovered surgical day has only one unassigned surgical
-    # nurse left, that nurse must take B.
-    if problem.is_surgical_day(day):
-        has_surgery_shift = any(
-            state.roster[surgical_nurse][day] == "B"
-            for surgical_nurse in range(problem.Ns)
-        )
-        if not has_surgery_shift:
-            remaining_surgical_nurses = [
-                surgical_nurse
-                for surgical_nurse in range(problem.Ns)
-                if state.roster[surgical_nurse][day] is None
-            ]
-            if len(remaining_surgical_nurses) == 1:
-                last_surgical_nurse = remaining_surgical_nurses[0]
-                remove_values(
-                    last_surgical_nurse,
-                    day,
-                    {"M", "A", "E", "R"},
-                )
-
     # H8: once this nurse has reached K, every remaining cell must be R.
     if state.nurse_shift_load[nurse] == problem.max_shifts:
         for other_day in range(problem.D):
@@ -471,7 +534,9 @@ def forward_check(
 
     # H5: five consecutive assigned working days force each adjoining
     # unassigned day, if it exists, to R.
-    for start in range(problem.D - 4):
+    first_window_start = max(0, day - 4)
+    last_window_start = min(day, problem.D - 5)
+    for start in range(first_window_start, last_window_start + 1):
         if all(
             state.roster[nurse][window_day] not in {None, "R"}
             for window_day in range(start, start + 5)
@@ -486,6 +551,25 @@ def forward_check(
     # propagate until no affected day remains.
     while dirty_days:
         target_day = dirty_days.pop()
+
+        # H7: an uncovered surgical day must retain at least one B candidate;
+        # if exactly one remains, force that cell to B.
+        if (
+            problem.is_surgical_day(target_day)
+            and state.surgery_coverage[target_day] == 0
+        ):
+            if not state.surgery_candidates[target_day]:
+                restore_domains(state, changes)
+                return None
+            if len(state.surgery_candidates[target_day]) == 1:
+                last_surgical_nurse = next(
+                    iter(state.surgery_candidates[target_day])
+                )
+                remove_values(
+                    last_surgical_nurse,
+                    target_day,
+                    {"M", "A", "E", "R"},
+                )
 
         morning_needed = (
             problem.morning_required - state.morning_coverage[target_day]
@@ -639,6 +723,7 @@ def main() -> None:
     if len(sys.argv) != 3:
         raise SystemExit("usage: python part_a.py <input_csv_path> <output_json_path>")
 
+    sys.setrecursionlimit(5000)
     problem = parse_input(sys.argv[1])
     roster = solve(problem)
     write_solution(sys.argv[2], roster)
