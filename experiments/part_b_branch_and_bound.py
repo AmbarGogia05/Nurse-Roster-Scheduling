@@ -1,63 +1,81 @@
 #!/usr/bin/env python3
-"""Part B: nurse rostering soft-constraint optimization.
+"""EXPERIMENTAL variant: branch-and-bound with a convex per-nurse lower
+bound (see NOTES_part_b_literature.md, Part 2, item 1), run as a bounded
+first pass ahead of the existing local-search pipeline, keeping whichever
+result is better.
 
-Two strategies, tried in sequence, keeping whichever result is better
-(never worse than either alone):
+branch_and_bound() below performs DFS over the SAME (nurse,day)->shift
+CSP tree part_a's backtracking search already explores (reusing
+part_a.build_initial_state/select_unassigned_variable/order_domain_values/
+is_consistent/forward_check/assign/unassign/restore_domains directly --
+no hard-constraint logic is duplicated), but continues past the first
+complete solution found ("the incumbent"), pruning any branch whose
+lower bound on final cost already meets or exceeds the incumbent's cost.
 
-1. branch_and_bound(): DFS branch-and-bound over the SAME (nurse,day)
-   -> shift CSP tree part_a's backtracking search already explores
-   (reusing part_a.build_initial_state/select_unassigned_variable/
-   order_domain_values/is_consistent/forward_check/assign/unassign/
-   restore_domains directly -- no hard-constraint logic is duplicated),
-   continuing past the first complete solution found (the "incumbent"),
-   pruning any branch whose lower bound on final cost already meets or
-   exceeds the incumbent's cost. The bound is deliberately the SAFE,
-   simple form of a convex per-nurse argument (see
-   NOTES_part_b_literature.md, Part 2 item 1): for each nurse, 0 if any
-   of their days are still unassigned (always a valid under-estimate --
-   with remaining flexibility a nurse could in principle still reach
-   cost 0), else their EXACT final cost (fixed once all their days are
-   assigned). Summed over nurses this is a valid admissible lower bound,
-   so pruning on it can only discard branches that provably cannot beat
-   the incumbent, never the true optimum. Given only a small, absolute-
-   capped time slice (not a large fraction of the budget -- an earlier,
-   more generous allocation caused a real regression on an instance
-   where plain deterministic construction is itself borderline-slow,
-   since branch_and_bound() forces deterministic-only search, no
-   randomized-restart escape hatch), it typically still finds a usable,
-   often cost-*proven-optimal* incumbent on smaller/faster-constructing
-   instances -- measured 24->29 MATCHED (bundled-model-optimal) on a
-   150-case suite_001 sample, zero regressions.
-2. Construction (part_a.solve, including its own randomized-restart
-   fallback) + hill-climbing by repeatedly applying the best-improving
-   *cross-nurse same-day shift swap* -- exchanging two already-working
-   nurses' shift types on the same day. This move is headcount-preserving
-   by construction (the day's multiset of shift labels is unchanged), so
-   H4/H7 stay satisfied automatically; only H1/H2/H3/H5/H6/H8/H9 need a
-   cheap per-nurse recheck for the two nurses involved (H9 is trivially
-   satisfied since only already-working, i.e. non-leave, cells are
-   swapped). Steepest-descent with a bounded sideways-move budget, then
-   perturb-and-reclimb restarts with any remaining time (L05:
-   hill-climbing with sideways moves, random restarts). This is the
-   guaranteed-safe fallback: branch-and-bound's small time slice is
-   capped specifically so this path's effective budget stays close to
-   what it would get running alone.
+Lower bound, deliberately the SAFE/simple form of the convex bound
+described in the literature note (not the tighter "distribute remaining
+days evenly" form): for each nurse, 0 if any of their days are still
+unassigned (always a valid under-estimate -- with remaining flexibility a
+nurse could in principle still end up with cost as low as 0), else their
+EXACT final cost (fixed, no longer changeable, once all their days are
+assigned). Summed over nurses, this is a valid admissible lower bound on
+the cost of ANY completion of the current partial assignment -- it can
+never overestimate the true minimum achievable, so pruning on it can only
+discard branches that provably cannot beat the incumbent, never the true
+optimum. This trades some pruning power (it's not the tightest possible
+bound) for a soundness argument that's easy to verify by inspection.
+
+Because pruning only activates once an incumbent exists, and finding the
+first complete solution uses exactly the same search as part_a.solve's
+deterministic attempt, branch-and-bound reaches its first (feasible, not
+yet proven optimal) roster about as fast as plain construction would --
+so even a branch-and-bound run that never proves optimality within its
+time slice still typically has a usable, often-improved incumbent.
+
+Part B: nurse rostering soft-constraint optimization via local search.
+
+Design (see HANDOFF_experiments_llm.md and
+NOTES_correctness_and_approaches.md, Section C, Approach B): construct an
+initial valid roster by reusing part_a.solve (which itself includes the
+randomized-restart fallback -- see part_a.py's module docstring), then
+hill-climb by repeatedly applying the best-improving *cross-nurse
+same-day shift swap* -- exchanging two already-working nurses' shift
+types on the same day. This move is headcount-preserving by construction
+(the day's multiset of shift labels is unchanged), so H4/H7 stay
+satisfied automatically; only H1/H2/H3/H5/H6/H8/H9 need a cheap per-nurse
+recheck for the two nurses involved (H9 is trivially satisfied since only
+already-working, i.e. non-leave, cells are swapped). Uses steepest-descent
+with a bounded number of sideways moves to escape plateaus, then spends
+any remaining time budget on perturb-and-reclimb restarts (L05:
+hill-climbing with sideways moves, random restarts).
 
 Reuses part_a.py directly (Problem, parse_input, solve, shift_load,
-write_solution, and all the CSP-search internals branch_and_bound uses)
-rather than duplicating any backtracking/CSP logic.
+write_solution) rather than duplicating any backtracking/CSP logic.
+
+Benchmark summary (full detail in HANDOFF_experiments_llm.md): 28/34 valid
+rosters across the suite_002+003+004 checker suites (up from 0/34 -- Part B
+was unimplemented before); remaining gaps are one instance Part A itself
+doesn't solve (see part_a.py's docstring) and several of the hardest T=600s
+(and a couple of borderline T=30s) instances where the fixed
+30%-of-budget construction reservation isn't enough --
+see the handoff doc's "Known limitations" section.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import itertools
+import os
 import random
 import sys
 import time
 from typing import Optional
 
-import part_a
+try:
+    import part_a
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import part_a
 
 Shift = str
 Roster = list  # list[list[Shift]], roster[nurse][day]

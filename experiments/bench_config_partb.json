@@ -1,0 +1,11 @@
+{
+  "target": "part_b.py",
+  "part": "b",
+  "tests": "suite_002,suite_004",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "tier1": "experiments/part_b_tier1.py",
+    "branch_and_bound": "experiments/part_b_branch_and_bound.py"
+  }
+}
