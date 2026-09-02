@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Part B: nurse rostering soft-constraint optimization via local search.
+"""EXPERIMENTAL variant: Variable Neighborhood Descent (VND, the
+deterministic core of VNS -- Mladenovic & Hansen 1997; see
+NOTES_literature_review.md) on top of part_b.py's hill-climbing design.
+
+Adds a second, larger neighborhood -- a 3-nurse cyclic shift exchange on
+the same day (see apply_cycle/is_legal_cycle/cycle_cost_delta/
+best_cycle_move below), still headcount-preserving by the same reasoning
+as the pairwise swap. hill_climb() now escalates to this larger
+neighborhood only once the pairwise-swap neighborhood is exhausted
+(VND's standard "escalate on failure to improve, drop back to the
+smallest neighborhood on success" policy), instead of relying solely on
+perturb-and-restart to escape a pairwise-swap local optimum.
+
+Part B: nurse rostering soft-constraint optimization via local search.
 
 Design (see HANDOFF_experiments_llm.md and
 NOTES_correctness_and_approaches.md, Section C, Approach B): construct an
@@ -31,13 +44,20 @@ see the handoff doc's "Known limitations" section.
 from __future__ import annotations
 
 import dataclasses
-import itertools
+import os
 import random
 import sys
 import time
 from typing import Optional
 
-import part_a
+try:
+    import part_a
+except ImportError:
+    # When this file is copied to repo_root/part_b.py for benchmarking
+    # (see scripts/bench_experiment.sh), part_a is right there; when run
+    # directly from experiments/, part_a.py is one directory up.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import part_a
 
 Shift = str
 Roster = list  # list[list[Shift]], roster[nurse][day]
@@ -151,26 +171,78 @@ def swap_cost_delta(
     return new_cost - old_cost, new_ci, new_cj
 
 
-def hill_climb(
+def apply_cycle(roster: Roster, day: int, i: int, j: int, k: int) -> None:
+    """Rotate three nurses' shifts on `day`: i<-(old k), j<-(old i),
+    k<-(old j). Still headcount-preserving -- same multiset of shift
+    labels on that day, just relabeled among three nurses instead of two."""
+    si, sj, sk = roster[i][day], roster[j][day], roster[k][day]
+    roster[i][day], roster[j][day], roster[k][day] = sk, si, sj
+
+
+def is_legal_cycle(roster: Roster, problem: "part_a.Problem", day: int, i: int, j: int, k: int) -> bool:
+    if len({i, j, k}) != 3:
+        return False
+    si, sj, sk = roster[i][day], roster[j][day], roster[k][day]
+    if si == "R" or sj == "R" or sk == "R":
+        return False
+    if si == sj == sk:
+        return False
+
+    apply_cycle(roster, day, i, j, k)
+    ok = (
+        nurse_hard_constraints_ok(roster, problem, i)
+        and nurse_hard_constraints_ok(roster, problem, j)
+        and nurse_hard_constraints_ok(roster, problem, k)
+    )
+    roster[i][day], roster[j][day], roster[k][day] = si, sj, sk  # direct revert
+    return ok
+
+
+def cycle_cost_delta(
     roster: Roster,
     problem: "part_a.Problem",
+    counts: list[tuple[int, int, int]],
+    day: int,
+    i: int,
+    j: int,
+    k: int,
+) -> Optional[tuple[int, tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]]:
+    """Same idea as swap_cost_delta, for the 3-nurse cyclic-exchange move."""
+    si, sj, sk = roster[i][day], roster[j][day], roster[k][day]
+    if not is_legal_cycle(roster, problem, day, i, j, k):
+        return None
+
+    old_cost = (
+        nurse_local_cost(*counts[i]) + nurse_local_cost(*counts[j]) + nurse_local_cost(*counts[k])
+    )
+    apply_cycle(roster, day, i, j, k)
+    new_ci = nurse_shift_counts(roster, problem.D, i)
+    new_cj = nurse_shift_counts(roster, problem.D, j)
+    new_ck = nurse_shift_counts(roster, problem.D, k)
+    roster[i][day], roster[j][day], roster[k][day] = si, sj, sk  # direct revert
+    new_cost = nurse_local_cost(*new_ci) + nurse_local_cost(*new_cj) + nurse_local_cost(*new_ck)
+    return new_cost - old_cost, new_ci, new_cj, new_ck
+
+
+def best_swap_move(
+    roster: Roster,
+    problem: "part_a.Problem",
+    counts: list[tuple[int, int, int]],
+    by_day: list[list[int]],
     deadline: float,
-    max_sideways: int = 20,
-) -> tuple[Roster, int]:
-    """Steepest-descent hill-climbing with a bounded sideways-move budget,
-    over the cross-nurse same-day swap neighborhood (L05: hill-climbing +
-    sideways moves)."""
-    counts = [nurse_shift_counts(roster, problem.D, n) for n in range(problem.N)]
-    cost = sum(nurse_local_cost(*c) for c in counts)
-    sideways_used = 0
-
-    while time.monotonic() < deadline:
-        by_day = working_nurses_by_day(roster, problem)
-        best_delta = 0
-        best_move = None
-
-        for day in range(problem.D):
-            for i, j in itertools.combinations(by_day[day], 2):
+    sideways_used: int,
+    max_sideways: int,
+):
+    """Scan the pairwise-swap neighborhood (N1) for the best move."""
+    best_delta = 0
+    best_move = None
+    for day in range(problem.D):
+        nurses = by_day[day]
+        n = len(nurses)
+        for a_idx in range(n):
+            i = nurses[a_idx]
+            for b_idx in range(a_idx + 1, n):
+                j = nurses[b_idx]
                 result = swap_cost_delta(roster, problem, counts, day, i, j)
                 if result is None:
                     continue
@@ -180,17 +252,90 @@ def hill_climb(
                 ):
                     best_delta = delta
                     best_move = (day, i, j, new_ci, new_cj)
-            if time.monotonic() >= deadline:
-                break
+        if time.monotonic() >= deadline:
+            break
+    return best_delta, best_move
 
-        if best_move is None:
+
+def best_cycle_move(
+    roster: Roster,
+    problem: "part_a.Problem",
+    counts: list[tuple[int, int, int]],
+    by_day: list[list[int]],
+    deadline: float,
+):
+    """Scan the 3-nurse cyclic-exchange neighborhood (N2, larger than N1)
+    for an improving move. Only tried once N1 is exhausted (VND
+    convention: escalate to a larger neighborhood on failure to improve,
+    drop back to the smallest on success)."""
+    best_delta = 0
+    best_move = None
+    for day in range(problem.D):
+        nurses = by_day[day]
+        n = len(nurses)
+        for a_idx in range(n):
+            i = nurses[a_idx]
+            for b_idx in range(a_idx + 1, n):
+                j = nurses[b_idx]
+                for c_idx in range(b_idx + 1, n):
+                    k = nurses[c_idx]
+                    result = cycle_cost_delta(roster, problem, counts, day, i, j, k)
+                    if result is None:
+                        continue
+                    delta, new_ci, new_cj, new_ck = result
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_move = (day, i, j, k, new_ci, new_cj, new_ck)
+        if time.monotonic() >= deadline:
+            break
+    return best_delta, best_move
+
+
+def hill_climb(
+    roster: Roster,
+    problem: "part_a.Problem",
+    deadline: float,
+    max_sideways: int = 20,
+) -> tuple[Roster, int]:
+    """Variable Neighborhood Descent (VND, the deterministic core of VNS --
+    Mladenovic & Hansen 1997; see NOTES_literature_review.md): hill-climb
+    the pairwise-swap neighborhood (N1) with sideways moves to a local
+    optimum; when N1 has no improving/sideways move left, escalate to the
+    larger 3-nurse cyclic-exchange neighborhood (N2) and, if it finds an
+    improving move, apply it and drop back to N1 (a move in N2 can unlock
+    further N1 improvements). Only when NEITHER neighborhood has an
+    improving move are we at a local optimum w.r.t. both, and we stop."""
+    counts = [nurse_shift_counts(roster, problem.D, n) for n in range(problem.N)]
+    cost = sum(nurse_local_cost(*c) for c in counts)
+    sideways_used = 0
+
+    while time.monotonic() < deadline:
+        by_day = working_nurses_by_day(roster, problem)
+
+        delta, move = best_swap_move(
+            roster, problem, counts, by_day, deadline, sideways_used, max_sideways
+        )
+        if move is not None:
+            day, i, j, new_ci, new_cj = move
+            apply_swap(roster, day, i, j)
+            counts[i], counts[j] = new_ci, new_cj
+            cost += delta
+            sideways_used = sideways_used + 1 if delta == 0 else 0
+            continue
+
+        if time.monotonic() >= deadline:
             break
 
-        day, i, j, new_ci, new_cj = best_move
-        apply_swap(roster, day, i, j)
-        counts[i], counts[j] = new_ci, new_cj
-        cost += best_delta
-        sideways_used = sideways_used + 1 if best_delta == 0 else 0
+        cycle_delta, cycle_move = best_cycle_move(roster, problem, counts, by_day, deadline)
+        if cycle_move is not None:
+            day, i, j, k, new_ci, new_cj, new_ck = cycle_move
+            apply_cycle(roster, day, i, j, k)
+            counts[i], counts[j], counts[k] = new_ci, new_cj, new_ck
+            cost += cycle_delta
+            sideways_used = 0
+            continue  # drop back to N1 (VND convention)
+
+        break  # local optimum w.r.t. both neighborhoods
 
     return roster, cost
 

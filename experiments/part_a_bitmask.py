@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Part A: nurse rostering as a constraint satisfaction problem.
+"""EXPERIMENTAL variant: bitmask domain representation. Per-cell domains
+(`set[Shift]`, e.g. {"M","A","B"}) are replaced with 5-bit integers (see
+M_BIT/A_BIT/E_BIT/R_BIT/B_BIT and BIT_OF/SHIFT_OF/domain_bits() near the
+top of this file). Domain add/remove/membership/popcount become bitwise
+ops and int.bit_count() (Python 3.10) instead of Python set method calls,
+which carry real per-call overhead (hashing, allocation, dispatch) that
+cProfile showed as roughly half of total tottime on a sustained search.
+The four per-day candidate sets (morning/afternoon/evening/surgery
+candidates) are deliberately left as regular sets in this experiment --
+only domains were converted, to keep the change bounded and easier to
+verify; converting the candidate sets too is a natural follow-up. See
+NOTES_python_perf_experiments.md for the timing comparison.
+
+Part A: nurse rostering as a constraint satisfaction problem.
 
 The intended CSP model is:
 
@@ -9,21 +22,12 @@ The intended CSP model is:
 
 Solved via CSP backtracking search: MRV variable ordering (O(1) via
 domain-size buckets), a heuristic value-ordering scorer, and incremental
-forward checking that enforces H2/H3/H4/H5/H6/H7/H8 proactively. Domains
-are represented as 5-bit integer bitmasks (M_BIT/A_BIT/E_BIT/R_BIT/B_BIT,
-see BIT_OF/SHIFT_OF/domain_bits() below) rather than `set[Shift]` --
-membership/union/popcount become bitwise ops and `int.bit_count()`
-(Python 3.10) instead of Python set method calls, which carry real
-per-call overhead at the millions of calls a search like this makes. The
-four per-day candidate sets (morning/afternoon/evening/surgery
-candidates) remain regular sets. `Problem`/`SearchState` use
-`dataclass(slots=True)` to cut per-attribute-access overhead.
+forward checking that enforces H2/H3/H4/H5/H6/H7/H8 proactively.
 
-Additional techniques on top of that base search, all validated via the
-Dockerized checker against checker/test-cases (see
-HANDOFF_experiments_llm.md, NOTES_competitive_optimization.md, and
-NOTES_python_perf_experiments.md for the full benchmark numbers and
-derivations):
+Three additional techniques on top of that base search, all validated via
+the Dockerized checker against checker/test-cases (see
+HANDOFF_experiments_llm.md and NOTES_competitive_optimization.md for the
+full benchmark numbers and derivations):
 
   1. Randomized-restart fallback (select_unassigned_variable,
      order_domain_values, solve). The deterministic heuristic-guided first
@@ -52,13 +56,11 @@ derivations):
      can only detect more true-infeasible instances faster, never produce
      a false positive.
 
-Benchmark summary: 1017/1024 PASS (99.3%) across the combined suite_001
-(1000 cases) + suite_002 (24 cases) checker suites (see
-HANDOFF_experiments_llm.md), and, with the bitmask/hoisted-constants
-speedups on top, 24/24 PASS on suite_002 alone in roughly a fifth of the
-prior wall time, zero regressions throughout (see
-NOTES_python_perf_experiments.md for the full performance-experiment
-results).
+Benchmark summary (full detail in HANDOFF_experiments_llm.md): 1017/1024
+PASS (99.3%) across the combined suite_001 (1000 cases) + suite_002 (24
+cases) checker suites, vs. 953/1024 (93.1%) for the prior implementation,
+with zero regressions (every remaining failure was already failing before)
+and 43% less total checker wall time.
 """
 
 from __future__ import annotations
@@ -71,8 +73,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-# Module-level RNG: None in deterministic mode (the default), set to a
-# seeded Random() during randomized-restart attempts (see solve()).
+# Module-level RNG, None in deterministic mode (matches the original
+# real part_a.py exactly), set to a seeded Random() during randomized
+# restart attempts. Module-level rather than threaded through every call
+# to keep this experiment's diff against part_a.py minimal and localized.
 _RNG: Optional[random.Random] = None
 
 
@@ -104,15 +108,6 @@ SURGICAL_DOMAIN = M_BIT | A_BIT | E_BIT | R_BIT | B_BIT
 NON_SURGICAL_DOMAIN = M_BIT | A_BIT | E_BIT | R_BIT
 SHIFT_ORDER: tuple[Shift, ...] = ("M", "A", "E", "R", "B")
 
-# String-keyed frozensets, for the small number of remaining comparisons
-# against the `shift: Shift` parameter itself (a string), as opposed to a
-# cell's domain (which is bitmask-typed above). Built once at import time
-# rather than as literals rebuilt on every call.
-SHIFT_MB = frozenset({"M", "B"})
-SHIFT_AB = frozenset({"A", "B"})
-SHIFT_ME = frozenset({"M", "E"})
-NONE_R_STR = frozenset({None, "R"})
-
 
 def domain_bits(mask: int) -> "list[Shift]":
     """Iterate the shift values present in a bitmask domain, in
@@ -120,7 +115,7 @@ def domain_bits(mask: int) -> "list[Shift]":
     return [shift for shift in SHIFT_ORDER if mask & BIT_OF[shift]]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Problem:
     """Immutable input instance."""
 
@@ -146,7 +141,7 @@ class Problem:
         return self.leaves[nurse * self.D + day] == "L"
 
 
-@dataclass(slots=True)
+@dataclass
 class SearchState:
     """Mutable information maintained during backtracking."""
 
@@ -405,13 +400,13 @@ def score_domain_value(
 
     # Count the values this choice would remove from adjacent-day domains.
     if day > 0 and state.roster[nurse][day - 1] is None:
-        if shift in SHIFT_MB:
+        if shift in {"M", "B"}:
             score += (state.domains[nurse][day - 1] & MBE).bit_count()
         elif shift == "A":
             score += int(bool(state.domains[nurse][day - 1] & B_BIT))
 
     if day + 1 < problem.D and state.roster[nurse][day + 1] is None:
-        if shift in SHIFT_ME:
+        if shift in {"M", "E"}:
             score += (state.domains[nurse][day + 1] & MB).bit_count()
         elif shift == "B":
             score += (state.domains[nurse][day + 1] & MAB).bit_count()
@@ -431,7 +426,7 @@ def score_domain_value(
         return 0
 
     morning_needed = problem.morning_required - state.morning_coverage[day]
-    if shift not in SHIFT_MB and nurse in state.morning_candidates[day]:
+    if shift not in {"M", "B"} and nurse in state.morning_candidates[day]:
         score += slack_penalty(
             len(state.morning_candidates[day]), morning_needed
         )
@@ -439,7 +434,7 @@ def score_domain_value(
     afternoon_needed = (
         problem.afternoon_required - state.afternoon_coverage[day]
     )
-    if shift not in SHIFT_AB and nurse in state.afternoon_candidates[day]:
+    if shift not in {"A", "B"} and nurse in state.afternoon_candidates[day]:
         score += slack_penalty(
             len(state.afternoon_candidates[day]), afternoon_needed
         )
@@ -583,9 +578,9 @@ def assign(state: SearchState, nurse: int, day: int, shift: Shift) -> None:
     state.domain_buckets[state.domains[nurse][day].bit_count()].remove((nurse, day))
     state.roster[nurse][day] = shift
     update_coverage_candidates(state, nurse, day)
-    if shift in SHIFT_MB:
+    if shift in {"M", "B"}:
         state.morning_coverage[day] += 1
-    if shift in SHIFT_AB:
+    if shift in {"A", "B"}:
         state.afternoon_coverage[day] += 1
     if shift == "E":
         state.evening_coverage[day] += 1
@@ -602,9 +597,9 @@ def unassign(state: SearchState, nurse: int, day: int, shift: Shift) -> None:
         raise ValueError("assignment rollback does not match current value")
 
     state.roster[nurse][day] = None
-    if shift in SHIFT_MB:
+    if shift in {"M", "B"}:
         state.morning_coverage[day] -= 1
-    if shift in SHIFT_AB:
+    if shift in {"A", "B"}:
         state.afternoon_coverage[day] -= 1
     if shift == "E":
         state.evening_coverage[day] -= 1
@@ -660,7 +655,7 @@ def forward_check(
 
     # H2, H3, H6: prune the previous and next day for this nurse.
     if day > 0:
-        if shift in SHIFT_MB:
+        if shift in {"M", "B"}:
             remove_values(nurse, day - 1, MBE)
         elif shift == "A":
             remove_values(nurse, day - 1, B_BIT)
@@ -684,7 +679,7 @@ def forward_check(
     last_window_start = min(day, problem.D - 5)
     for start in range(first_window_start, last_window_start + 1):
         if all(
-            state.roster[nurse][window_day] not in NONE_R_STR
+            state.roster[nurse][window_day] not in {None, "R"}
             for window_day in range(start, start + 5)
         ):
             if start > 0:

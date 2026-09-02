@@ -1,0 +1,10 @@
+{
+  "target": "part_b.py",
+  "part": "b",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "vns": "experiments/part_b_vns.py"
+  }
+}

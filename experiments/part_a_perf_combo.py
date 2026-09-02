@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Part A: nurse rostering as a constraint satisfaction problem.
+"""EXPERIMENTAL variant: combines the two independently-validated Python
+performance wins from NOTES_python_perf_experiments.md:
+  1. Bitmask domain representation. Per-cell domains (`set[Shift]`, e.g.
+     {"M","A","B"}) are replaced with 5-bit integers (see
+     M_BIT/A_BIT/E_BIT/R_BIT/B_BIT and BIT_OF/SHIFT_OF/domain_bits() near
+     the top of this file). Domain add/remove/membership/popcount become
+     bitwise ops and int.bit_count() (Python 3.10) instead of Python set
+     method calls. The four per-day candidate sets (morning/afternoon/
+     evening/surgery candidates) are deliberately left as regular sets --
+     only domains were converted, to keep the change bounded; converting
+     the candidate sets too remains a further follow-up.
+  2. Hoisted constants: every remaining repeated small set/frozenset
+     literal (both bitmask constants like MB/AB/... for domain
+     comparisons, and string-keyed ones like SHIFT_MB/NONE_R_STR for the
+     few remaining comparisons against the `shift` parameter itself) is a
+     module-level constant, never rebuilt per call. `slots=True` on
+     `Problem`/`SearchState` too.
+Validated individually (part_a_bitmask.py: 24/24 suite_002 PASS, -79%
+wall time; part_a_hoisted_constants.py: zero regressions, -15% wall time)
+-- this variant tests whether they compound. See
+NOTES_python_perf_experiments.md for the timing comparison.
+
+Part A: nurse rostering as a constraint satisfaction problem.
 
 The intended CSP model is:
 
@@ -9,21 +31,12 @@ The intended CSP model is:
 
 Solved via CSP backtracking search: MRV variable ordering (O(1) via
 domain-size buckets), a heuristic value-ordering scorer, and incremental
-forward checking that enforces H2/H3/H4/H5/H6/H7/H8 proactively. Domains
-are represented as 5-bit integer bitmasks (M_BIT/A_BIT/E_BIT/R_BIT/B_BIT,
-see BIT_OF/SHIFT_OF/domain_bits() below) rather than `set[Shift]` --
-membership/union/popcount become bitwise ops and `int.bit_count()`
-(Python 3.10) instead of Python set method calls, which carry real
-per-call overhead at the millions of calls a search like this makes. The
-four per-day candidate sets (morning/afternoon/evening/surgery
-candidates) remain regular sets. `Problem`/`SearchState` use
-`dataclass(slots=True)` to cut per-attribute-access overhead.
+forward checking that enforces H2/H3/H4/H5/H6/H7/H8 proactively.
 
-Additional techniques on top of that base search, all validated via the
-Dockerized checker against checker/test-cases (see
-HANDOFF_experiments_llm.md, NOTES_competitive_optimization.md, and
-NOTES_python_perf_experiments.md for the full benchmark numbers and
-derivations):
+Three additional techniques on top of that base search, all validated via
+the Dockerized checker against checker/test-cases (see
+HANDOFF_experiments_llm.md and NOTES_competitive_optimization.md for the
+full benchmark numbers and derivations):
 
   1. Randomized-restart fallback (select_unassigned_variable,
      order_domain_values, solve). The deterministic heuristic-guided first
@@ -52,13 +65,11 @@ derivations):
      can only detect more true-infeasible instances faster, never produce
      a false positive.
 
-Benchmark summary: 1017/1024 PASS (99.3%) across the combined suite_001
-(1000 cases) + suite_002 (24 cases) checker suites (see
-HANDOFF_experiments_llm.md), and, with the bitmask/hoisted-constants
-speedups on top, 24/24 PASS on suite_002 alone in roughly a fifth of the
-prior wall time, zero regressions throughout (see
-NOTES_python_perf_experiments.md for the full performance-experiment
-results).
+Benchmark summary (full detail in HANDOFF_experiments_llm.md): 1017/1024
+PASS (99.3%) across the combined suite_001 (1000 cases) + suite_002 (24
+cases) checker suites, vs. 953/1024 (93.1%) for the prior implementation,
+with zero regressions (every remaining failure was already failing before)
+and 43% less total checker wall time.
 """
 
 from __future__ import annotations
@@ -71,8 +82,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-# Module-level RNG: None in deterministic mode (the default), set to a
-# seeded Random() during randomized-restart attempts (see solve()).
+# Module-level RNG, None in deterministic mode (matches the original
+# real part_a.py exactly), set to a seeded Random() during randomized
+# restart attempts. Module-level rather than threaded through every call
+# to keep this experiment's diff against part_a.py minimal and localized.
 _RNG: Optional[random.Random] = None
 
 
@@ -104,10 +117,12 @@ SURGICAL_DOMAIN = M_BIT | A_BIT | E_BIT | R_BIT | B_BIT
 NON_SURGICAL_DOMAIN = M_BIT | A_BIT | E_BIT | R_BIT
 SHIFT_ORDER: tuple[Shift, ...] = ("M", "A", "E", "R", "B")
 
-# String-keyed frozensets, for the small number of remaining comparisons
+# String-keyed frozensets, for the (small number of) remaining comparisons
 # against the `shift: Shift` parameter itself (a string), as opposed to a
-# cell's domain (which is bitmask-typed above). Built once at import time
-# rather than as literals rebuilt on every call.
+# cell's domain (which is bitmask-typed above) -- same hoisting rationale
+# as experiments/part_a_hoisted_constants.py, combined here with the
+# bitmask domain conversion since both are independently-validated,
+# orthogonal wins. See NOTES_python_perf_experiments.md.
 SHIFT_MB = frozenset({"M", "B"})
 SHIFT_AB = frozenset({"A", "B"})
 SHIFT_ME = frozenset({"M", "E"})

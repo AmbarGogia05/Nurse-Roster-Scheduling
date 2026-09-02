@@ -1,0 +1,10 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "hoisted_constants": "experiments/part_a_hoisted_constants.py"
+  }
+}

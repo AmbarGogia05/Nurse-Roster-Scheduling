@@ -1,0 +1,12 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "bitmask": "experiments/part_a_bitmask.py",
+    "heapq_mrv": "experiments/part_a_heapq_mrv.py",
+    "deque_worklist": "experiments/part_a_deque_worklist.py"
+  }
+}

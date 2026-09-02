@@ -1,0 +1,14 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002/test1.csv,suite_002/test22.csv,suite_003/test7.csv,suite_003/test8.csv,suite_001/test25.csv",
+  "jobs": 5,
+  "cpus": 6,
+  "variants": {
+    "mac": "experiments/part_a_mac.py",
+    "cbj": "experiments/part_a_cbj.py",
+    "domwdeg": "experiments/part_a_domwdeg.py",
+    "luby_restart": "experiments/part_a_luby_restart.py",
+    "gcc_filter": "experiments/part_a_gcc_filter.py"
+  }
+}

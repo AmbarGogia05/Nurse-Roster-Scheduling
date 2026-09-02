@@ -1,0 +1,11 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "luby_restart": "experiments/part_a_luby_restart.py",
+    "gcc_filter": "experiments/part_a_gcc_filter.py"
+  }
+}

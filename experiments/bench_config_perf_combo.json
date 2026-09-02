@@ -1,0 +1,10 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "perf_combo": "experiments/part_a_perf_combo.py"
+  }
+}

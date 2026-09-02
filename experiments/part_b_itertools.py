@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Part B: nurse rostering soft-constraint optimization via local search.
+"""EXPERIMENTAL variant: itertools.combinations for hill_climb()'s
+pairwise-swap neighborhood scan, replacing the manual nested index loop
+(`for a_idx in range(n): for b_idx in range(a_idx+1, n): ...`). C-level
+iteration, no algorithmic change. See NOTES_python_perf_experiments.md
+for the timing comparison.
+
+Part B: nurse rostering soft-constraint optimization via local search.
 
 Design (see HANDOFF_experiments_llm.md and
 NOTES_correctness_and_approaches.md, Section C, Approach B): construct an
@@ -32,12 +38,17 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import os
 import random
 import sys
 import time
 from typing import Optional
 
-import part_a
+try:
+    import part_a
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import part_a
 
 Shift = str
 Roster = list  # list[list[Shift]], roster[nurse][day]
