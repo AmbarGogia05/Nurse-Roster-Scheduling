@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -268,13 +269,103 @@ def basic_feasibility_checks(p: Problem) -> bool:
 
 
 def select_unassigned_variable(
-    problem: Problem, state: SearchState
+    problem: Problem,
+    state: SearchState,
+    rng: Optional[random.Random] = None,
 ) -> Optional[Variable]:
-    """Choose an unassigned cell using minimum remaining values."""
+    """Choose an unassigned cell using MRV, then constraint pressure."""
     for bucket in state.domain_buckets:
-        if bucket:
-            return next(iter(bucket))
+        if not bucket:
+            continue
+
+        if rng is not None:
+            return rng.choice(tuple(bucket))
+
+        best_variable: Optional[Variable] = None
+        best_key: Optional[tuple[int, int]] = None
+
+        for nurse, day in bucket:
+            domain = state.domains[nurse][day]
+            if domain == {"R"}:
+                key = (1, 0)
+            else:
+                penalty = day_penalty(problem, state, nurse, day)
+                pressure = sequence_pressure(problem, state, nurse, day)
+                key = (0, penalty - pressure)
+
+            if best_key is None or key < best_key:
+                best_variable = (nurse, day)
+                best_key = key
+
+        return best_variable
+
     return None
+
+
+def day_penalty(
+    problem: Problem,
+    state: SearchState,
+    nurse: int,
+    day: int,
+) -> int:
+    """Return the tightest daily-coverage slack relevant to this cell."""
+    domain = state.domains[nurse][day]
+    slacks = []
+
+    if domain & {"M", "B"}:
+        morning_needed = (
+            problem.morning_required - state.morning_coverage[day]
+        )
+        slacks.append(len(state.morning_candidates[day]) - morning_needed)
+
+    if domain & {"A", "B"}:
+        afternoon_needed = (
+            problem.afternoon_required - state.afternoon_coverage[day]
+        )
+        slacks.append(
+            len(state.afternoon_candidates[day]) - afternoon_needed
+        )
+
+    if "E" in domain:
+        evening_needed = (
+            problem.evening_required - state.evening_coverage[day]
+        )
+        slacks.append(len(state.evening_candidates[day]) - evening_needed)
+
+    if (
+        "B" in domain
+        and problem.is_surgical_day(day)
+        and state.surgery_coverage[day] == 0
+    ):
+        slacks.append(len(state.surgery_candidates[day]) - 1)
+
+    return min(slacks)
+
+
+def sequence_pressure(
+    problem: Problem,
+    state: SearchState,
+    nurse: int,
+    day: int,
+) -> int:
+    """Return the strongest five-day work sequence containing this cell."""
+    first_start = max(0, day - 4)
+    last_start = min(day, problem.D - 5)
+    pressure = 0
+
+    for start in range(first_start, last_start + 1):
+        assigned_work = 0
+
+        for window_day in range(start, start + 5):
+            assigned_shift = state.roster[nurse][window_day]
+            if assigned_shift == "R":
+                break
+            if assigned_shift is not None:
+                assigned_work += 1
+        else:
+            pressure = max(pressure, assigned_work)
+
+    return pressure
 
 
 def score_domain_value(
@@ -356,20 +447,27 @@ def order_domain_values(
     nurse: int,
     day: int,
     scorer: ValueScorer = score_domain_value,
+    rng: Optional[random.Random] = None,
 ) -> list[Shift]:
     """Order consistent values using the supplied estimated-cost function."""
     shift_order = ("M", "A", "E", "R", "B")
-    scored_values: list[tuple[float, int, Shift]] = []
+    consistent_values = []
 
-    for order, shift in enumerate(shift_order):
+    for shift in shift_order:
         if shift not in state.domains[nurse][day]:
             continue
         if not is_consistent(problem, state, nurse, day, shift):
             continue
+        consistent_values.append(shift)
 
-        score = scorer(problem, state, nurse, day, shift)
-        scored_values.append((score, order, shift))
+    if rng is not None:
+        rng.shuffle(consistent_values)
+        return consistent_values
 
+    scored_values = [
+        (scorer(problem, state, nurse, day, shift), order, shift)
+        for order, shift in enumerate(consistent_values)
+    ]
     scored_values.sort()
     return [shift for _, _, shift in scored_values]
 
@@ -498,19 +596,30 @@ def forward_check(
     changes: list[DomainChange] = []
     dirty_days = {day}
 
-    def remove_values(target_nurse: int, target_day: int, values: set[Shift]) -> None:
+    def remove_values(
+        target_nurse: int,
+        target_day: int,
+        values: set[Shift],
+    ) -> None:
         if state.roster[target_nurse][target_day] is not None:
             return
+
+        domain = state.domains[target_nurse][target_day]
+        cell = (target_nurse, target_day)
+        removed_any = False
+
         for value in values:
-            if value in state.domains[target_nurse][target_day]:
-                old_size = len(state.domains[target_nurse][target_day])
-                cell = (target_nurse, target_day)
+            if value in domain:
+                old_size = len(domain)
                 state.domain_buckets[old_size].remove(cell)
-                state.domains[target_nurse][target_day].remove(value)
+                domain.remove(value)
                 state.domain_buckets[old_size - 1].add(cell)
-                update_coverage_candidates(state, target_nurse, target_day)
                 changes.append((target_nurse, target_day, value))
-                dirty_days.add(target_day)
+                removed_any = True
+
+        if removed_any:
+            update_coverage_candidates(state, target_nurse, target_day)
+            dirty_days.add(target_day)
 
     # H2, H3, H6: prune the previous and next day for this nurse.
     if day > 0:
@@ -628,12 +737,17 @@ def forward_check(
 
 def restore_domains(state: SearchState, changes: list[DomainChange]) -> None:
     """Undo domain removals in reverse order."""
+    touched_cells: set[Variable] = set()
+
     for nurse, day, shift in reversed(changes):
         old_size = len(state.domains[nurse][day])
         cell = (nurse, day)
         state.domain_buckets[old_size].remove(cell)
         state.domains[nurse][day].add(shift)
         state.domain_buckets[old_size + 1].add(cell)
+        touched_cells.add(cell)
+
+    for nurse, day in touched_cells:
         update_coverage_candidates(state, nurse, day)
 
 
@@ -653,7 +767,12 @@ def final_constraints_hold(problem: Problem, state: SearchState) -> bool:
     return True
 
 
-def backtrack(problem: Problem, state: SearchState, deadline: float) -> bool:
+def backtrack(
+    problem: Problem,
+    state: SearchState,
+    deadline: float,
+    rng: Optional[random.Random] = None,
+) -> bool:
     """Run depth-first backtracking with forward checking."""
     if time.monotonic() >= deadline:
         raise SearchTimeout
@@ -661,12 +780,12 @@ def backtrack(problem: Problem, state: SearchState, deadline: float) -> bool:
     if state.unassigned_count == 0:
         return final_constraints_hold(problem, state)
 
-    variable = select_unassigned_variable(problem, state)
+    variable = select_unassigned_variable(problem, state, rng)
     if variable is None:
         return False
     nurse, day = variable
 
-    for shift in order_domain_values(problem, state, nurse, day):
+    for shift in order_domain_values(problem, state, nurse, day, rng=rng):
         if not is_consistent(problem, state, nurse, day, shift):
             continue
 
@@ -674,7 +793,7 @@ def backtrack(problem: Problem, state: SearchState, deadline: float) -> bool:
         changes = forward_check(problem, state, nurse, day, shift)
 
         if changes is not None:
-            if backtrack(problem, state, deadline):
+            if backtrack(problem, state, deadline, rng):
                 return True
             restore_domains(state, changes)
 
@@ -683,24 +802,61 @@ def backtrack(problem: Problem, state: SearchState, deadline: float) -> bool:
     return False
 
 
+def search_attempt(
+    problem: Problem,
+    deadline: float,
+    rng: Optional[random.Random],
+) -> tuple[Optional[bool], SearchState]:
+    """Run one fresh search; None means that its time slice expired."""
+    state = build_initial_state(problem)
+
+    try:
+        solved = backtrack(problem, state, deadline, rng)
+    except SearchTimeout:
+        return None, state
+
+    return solved, state
+
+
 def solve(problem: Problem) -> Optional[list[list[Shift]]]:
-    """Return a valid N-by-D roster, or None if none is found in time."""
+    """Return a valid N-by-D roster, using restarts after a slow first search."""
     if not basic_feasibility_checks(problem):
         return None
 
-    state = build_initial_state(problem)
-    deadline = time.monotonic() + max(0.0, problem.time_limit)
+    time_budget = max(0.0, problem.time_limit)
+    overall_deadline = time.monotonic() + time_budget
 
-    try:
-        solved = backtrack(problem, state, deadline)
-    except SearchTimeout:
+    first_deadline = min(
+        overall_deadline,
+        time.monotonic() + 0.4 * time_budget,
+    )
+    solved, state = search_attempt(problem, first_deadline, None)
+
+    if solved:
+        return [[shift for shift in row] for row in state.roster]  # type: ignore[misc]
+    if solved is False:
         return None
 
-    if not solved:
-        return None
+    for seed, fraction in enumerate((0.1, 0.2, 0.3), start=1):
+        if time.monotonic() >= overall_deadline:
+            break
 
-    # A successful complete search guarantees that no entry is None.
-    return [[shift for shift in row] for row in state.roster]  # type: ignore[misc]
+        restart_deadline = min(
+            overall_deadline,
+            time.monotonic() + fraction * time_budget,
+        )
+        solved, state = search_attempt(
+            problem,
+            restart_deadline,
+            random.Random(seed),
+        )
+
+        if solved:
+            return [[shift for shift in row] for row in state.roster]  # type: ignore[misc]
+        if solved is False:
+            return None
+
+    return None
 
 
 def roster_to_json(roster: list[list[Shift]]) -> dict[str, Shift]:
