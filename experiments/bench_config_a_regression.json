@@ -1,0 +1,11 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "random_restart": "experiments/part_a_random_restart.py",
+    "restart_lcv": "experiments/part_a_restart_lcv.py"
+  }
+}

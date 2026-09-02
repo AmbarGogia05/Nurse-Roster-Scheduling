@@ -1,1 +1,8 @@
 __pycache__/
+
+# Course materials and a separate unofficial third-party checker repo --
+# not meant for version control here. See HANDOFF_experiments_llm.md for
+# how to get the checker (git clone).
+checker/
+Slides/
+A1-Intro-to-AI-Release.pdf

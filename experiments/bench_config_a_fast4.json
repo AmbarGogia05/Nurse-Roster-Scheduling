@@ -1,0 +1,10 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002/test1.csv,suite_002/test22.csv,suite_003/test7.csv,suite_003/test8.csv,suite_001/test25.csv",
+  "jobs": 5,
+  "cpus": 6,
+  "variants": {
+    "restart_lcv": "experiments/part_a_restart_lcv.py"
+  }
+}

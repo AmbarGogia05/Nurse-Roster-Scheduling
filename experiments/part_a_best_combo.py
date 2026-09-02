@@ -1,53 +1,40 @@
 #!/usr/bin/env python3
-"""Part A: nurse rostering as a constraint satisfaction problem.
+"""EXPERIMENTAL variant of part_a.py: "kitchen sink" combo.
+
+Combines three independently-validated, orthogonal, zero-regression
+improvements (see NOTES_competitive_optimization.md for individual
+benchmark results of each in isolation):
+  1. random_restart: randomized-tiebreak restarts when the deterministic
+     heuristic-guided attempt times out (the headline win: 993/1000 on
+     suite_001, zero regressions).
+  2. lazy_candidates: batch update_coverage_candidates calls per cell
+     touched instead of per value removed/restored (pure speed, ~50% more
+     search nodes/second on the profiled thrashing case).
+  3. matching_prune: a tighter, leave-aware necessary-infeasibility bound
+     in basic_feasibility_checks (~112x speedup on a constructed
+     infeasible counter-example, zero regressions on feasible instances).
+NOT yet benchmarked as a combination -- see NOTES_competitive_optimization.md
+for results once available.
+
+EXPERIMENTAL variant of part_a.py: randomized-tiebreak restarts.
+
+Forked from the real part_a.py. Targets the "thrashing" failure mode
+identified in NOTES_correctness_and_approaches.md (test25: ~27,000 wasted
+backtrack calls on an 80-variable, 100%-slack instance with abundant
+solutions -- a bad deterministic tie-break, not fundamental hardness). If
+the deterministic first attempt (byte-identical to part_a.py) times out
+without a conclusion, falls back to randomized-tiebreak restarts with
+short time slices carved from the remaining budget (L05: random restarts).
+See select_unassigned_variable, order_domain_values, and solve below for
+the specific changes.
+
+Part A: nurse rostering as a constraint satisfaction problem.
 
 The intended CSP model is:
 
     variable:       (nurse, day)
     value/domain:   one of M, A, E, R, B
     assignment:     roster[nurse][day]
-
-Solved via CSP backtracking search: MRV variable ordering (O(1) via
-domain-size buckets), a heuristic value-ordering scorer, and incremental
-forward checking that enforces H2/H3/H4/H5/H6/H7/H8 proactively.
-
-Three additional techniques on top of that base search, all validated via
-the Dockerized checker against checker/test-cases (see
-HANDOFF_experiments_llm.md and NOTES_competitive_optimization.md for the
-full benchmark numbers and derivations):
-
-  1. Randomized-restart fallback (select_unassigned_variable,
-     order_domain_values, solve). The deterministic heuristic-guided first
-     attempt is unchanged from the original solver, so already-fast
-     instances are unaffected. If it times out without a conclusion
-     (SearchTimeout, not a definite True/False), the search falls back to
-     short time-sliced restarts with UNIFORMLY RANDOM value ordering
-     (deliberately ignoring the heuristic scorer -- empirically, the
-     heuristic was found to actively mislead search on some instances; see
-     the handoff doc for the concrete case study). A restart's backtrack()
-     completing without hitting its own slice deadline is still a valid
-     proof of infeasibility regardless of tie-break order, since
-     forward-checking pruning never removes a genuine solution -- so this
-     can only help performance, never soundness.
-  2. Batched candidate-set updates (remove_values, restore_domains).
-     update_coverage_candidates is called once per cell actually touched
-     rather than once per individual domain value removed/restored, since
-     it only depends on the final domain state. Pure speed, no behavioral
-     change.
-  3. A tighter, leave-aware necessary-infeasibility bound
-     (basic_feasibility_checks). Replaces the naive N*K global capacity
-     bound with a per-nurse cap of min(K, per_day_cap * (D - that nurse's
-     leave-day count)), where per_day_cap is 2 for surgical nurses (a B
-     shift consumes 2 load-units in one day) and 1 for general nurses.
-     Strictly tighter than, never looser than, the original bound, so it
-     can only detect more true-infeasible instances faster, never produce
-     a false positive.
-
-Benchmark summary (full detail in HANDOFF_experiments_llm.md): 1017/1024
-PASS (99.3%) across the combined suite_001 (1000 cases) + suite_002 (24
-cases) checker suites, vs. 953/1024 (93.1%) for the prior implementation,
-with zero regressions (every remaining failure was already failing before)
-and 43% less total checker wall time.
 """
 
 from __future__ import annotations
@@ -60,7 +47,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-# Module-level RNG, None in deterministic mode (matches the original
+# EXPERIMENTAL: module-level RNG, None in deterministic mode (matches the
 # real part_a.py exactly), set to a seeded Random() during randomized
 # restart attempts. Module-level rather than threaded through every call
 # to keep this experiment's diff against part_a.py minimal and localized.
@@ -282,7 +269,7 @@ def update_coverage_candidates(
 
 
 def basic_feasibility_checks(p: Problem) -> bool:
-    """Leave-aware global capacity bound (derivation and a validated
+    """EXPERIMENTAL: leave-aware global capacity bound (see
     experiments/part_a_matching_prune.py for the full derivation and a
     validated counter-example). Strictly tighter than, never looser than,
     the original N*K bound."""
@@ -334,7 +321,7 @@ def select_unassigned_variable(
 ) -> Optional[Variable]:
     """Choose an unassigned cell using minimum remaining values.
 
-    When _RNG is set (randomized-restart mode), break MRV
+    EXPERIMENTAL: when _RNG is set (randomized-restart mode), break MRV
     ties randomly instead of by arbitrary set-iteration order, so repeated
     restarts explore genuinely different regions of the search tree.
     """
@@ -428,7 +415,7 @@ def order_domain_values(
 ) -> list[Shift]:
     """Order consistent values using the supplied estimated-cost function.
 
-    In randomized-restart mode (_RNG set), IGNORE the
+    EXPERIMENTAL: in randomized-restart mode (_RNG set), IGNORE the
     heuristic scorer entirely and use a uniformly random order instead of
     a randomized tiebreak on top of it. Empirically (see the `test25`
     thrashing case in NOTES_correctness_and_approaches.md /
@@ -589,7 +576,7 @@ def forward_check(
     dirty_days = {day}
 
     def remove_values(target_nurse: int, target_day: int, values: set[Shift]) -> None:
-        """Batch update_coverage_candidates to once per cell
+        """EXPERIMENTAL: batch update_coverage_candidates to once per cell
         touched (see experiments/part_a_lazy_candidates.py)."""
         if state.roster[target_nurse][target_day] is not None:
             return
@@ -725,7 +712,7 @@ def forward_check(
 def restore_domains(state: SearchState, changes: list[DomainChange]) -> None:
     """Undo domain removals in reverse order.
 
-    Defer update_coverage_candidates to once per unique cell
+    EXPERIMENTAL: defer update_coverage_candidates to once per unique cell
     touched (see experiments/part_a_lazy_candidates.py)."""
     touched_cells: set[Variable] = set()
     for nurse, day, shift in reversed(changes):
@@ -788,7 +775,7 @@ def backtrack(problem: Problem, state: SearchState, deadline: float) -> bool:
 def solve(problem: Problem) -> Optional[list[list[Shift]]]:
     """Return a valid N-by-D roster, or None if none is found in time.
 
-    After a deterministic first attempt (identical to the
+    EXPERIMENTAL: after a deterministic first attempt (identical to the
     real part_a.py, so already-fast cases are unaffected), fall back to
     randomized-tiebreak restarts with the remaining time budget if that
     attempt times out without a definite conclusion (L05: random restarts).

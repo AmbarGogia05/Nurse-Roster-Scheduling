@@ -1,42 +1,37 @@
 #!/usr/bin/env python3
-"""Part B: nurse rostering soft-constraint optimization via local search.
+"""EXPERIMENTAL Part B solver: local search over valid Part-A rosters.
 
-Design (see HANDOFF_experiments_llm.md and
-NOTES_correctness_and_approaches.md, Section C, Approach B): construct an
-initial valid roster by reusing part_a.solve (which itself includes the
-randomized-restart fallback -- see part_a.py's module docstring), then
-hill-climb by repeatedly applying the best-improving *cross-nurse
-same-day shift swap* -- exchanging two already-working nurses' shift
-types on the same day. This move is headcount-preserving by construction
-(the day's multiset of shift labels is unchanged), so H4/H7 stay
-satisfied automatically; only H1/H2/H3/H5/H6/H8/H9 need a cheap per-nurse
-recheck for the two nurses involved (H9 is trivially satisfied since only
-already-working, i.e. non-leave, cells are swapped). Uses steepest-descent
-with a bounded number of sideways moves to escape plateaus, then spends
-any remaining time budget on perturb-and-reclimb restarts (L05:
-hill-climbing with sideways moves, random restarts).
+Design (see NOTES_correctness_and_approaches.md, Section C, Approach B --
+the recommended primary approach): construct an initial valid roster by
+reusing part_a.solve, then hill-climb by repeatedly applying the
+best-improving *cross-nurse same-day shift swap* -- exchanging two already-
+working nurses' shift types on the same day. This move is headcount-
+preserving by construction (the day's multiset of shift labels is
+unchanged), so H4/H7 stay satisfied automatically; only H1/H2/H3/H5/H6/H8/H9
+need a cheap per-nurse recheck for the two nurses involved (H9 is trivially
+satisfied since only already-working, i.e. non-leave, cells are swapped).
+Uses steepest-descent with a bounded number of sideways moves to escape
+plateaus, then spends any remaining time budget on perturb-and-reclimb
+restarts (L05: hill-climbing with sideways moves, random restarts).
 
 Reuses part_a.py directly (Problem, parse_input, solve, shift_load,
 write_solution) rather than duplicating any backtracking/CSP logic.
-
-Benchmark summary (full detail in HANDOFF_experiments_llm.md): 28/34 valid
-rosters across the suite_002+003+004 checker suites (up from 0/34 -- Part B
-was unimplemented before); remaining gaps are one instance Part A itself
-doesn't solve (see part_a.py's docstring) and several of the hardest T=600s
-(and a couple of borderline T=30s) instances where the fixed
-30%-of-budget construction reservation isn't enough --
-see the handoff doc's "Known limitations" section.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
 import random
 import sys
 import time
 from typing import Optional
 
-import part_a
+try:
+    import part_a
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import part_a
 
 Shift = str
 Roster = list  # list[list[Shift]], roster[nurse][day]

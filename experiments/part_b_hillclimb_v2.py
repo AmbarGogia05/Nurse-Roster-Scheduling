@@ -1,42 +1,60 @@
 #!/usr/bin/env python3
-"""Part B: nurse rostering soft-constraint optimization via local search.
+"""EXPERIMENTAL Part B solver v2: local search on top of the improved
+(randomized-restart) Part A construction.
 
-Design (see HANDOFF_experiments_llm.md and
-NOTES_correctness_and_approaches.md, Section C, Approach B): construct an
-initial valid roster by reusing part_a.solve (which itself includes the
-randomized-restart fallback -- see part_a.py's module docstring), then
-hill-climb by repeatedly applying the best-improving *cross-nurse
-same-day shift swap* -- exchanging two already-working nurses' shift
-types on the same day. This move is headcount-preserving by construction
-(the day's multiset of shift labels is unchanged), so H4/H7 stay
-satisfied automatically; only H1/H2/H3/H5/H6/H8/H9 need a cheap per-nurse
-recheck for the two nurses involved (H9 is trivially satisfied since only
-already-working, i.e. non-leave, cells are swapped). Uses steepest-descent
-with a bounded number of sideways moves to escape plateaus, then spends
-any remaining time budget on perturb-and-reclimb restarts (L05:
-hill-climbing with sideways moves, random restarts).
+Identical to part_b_hillclimb.py except it constructs the initial roster
+via part_a_random_restart.solve instead of plain part_a.solve. The original
+part_b_hillclimb.py's failures (suite_002/test1, suite_002/test14,
+suite_004/test1, and 7/9 of suite_003) were all traced directly to Part
+A's construction phase timing out on the same hard instances found in
+NOTES_experiment_results.md. part_a_random_restart.py (pure randomized
+restart, WITHOUT the hybrid-LCV addition -- see
+NOTES_experiment_results.md for why the LCV combination was dropped: it
+introduced 4 new suite_001 regressions despite fixing one extra known-hard
+case) achieves 993/1000 on suite_001 with zero regressions, so this
+variant tests whether that improvement closes Part B's inherited failures
+too, without inheriting hybrid-LCV's instability.
+
+EXPERIMENTAL Part B solver: local search over valid Part-A rosters.
+
+Design (see NOTES_correctness_and_approaches.md, Section C, Approach B --
+the recommended primary approach): construct an initial valid roster by
+reusing part_a.solve, then hill-climb by repeatedly applying the
+best-improving *cross-nurse same-day shift swap* -- exchanging two already-
+working nurses' shift types on the same day. This move is headcount-
+preserving by construction (the day's multiset of shift labels is
+unchanged), so H4/H7 stay satisfied automatically; only H1/H2/H3/H5/H6/H8/H9
+need a cheap per-nurse recheck for the two nurses involved (H9 is trivially
+satisfied since only already-working, i.e. non-leave, cells are swapped).
+Uses steepest-descent with a bounded number of sideways moves to escape
+plateaus, then spends any remaining time budget on perturb-and-reclimb
+restarts (L05: hill-climbing with sideways moves, random restarts).
 
 Reuses part_a.py directly (Problem, parse_input, solve, shift_load,
 write_solution) rather than duplicating any backtracking/CSP logic.
-
-Benchmark summary (full detail in HANDOFF_experiments_llm.md): 28/34 valid
-rosters across the suite_002+003+004 checker suites (up from 0/34 -- Part B
-was unimplemented before); remaining gaps are one instance Part A itself
-doesn't solve (see part_a.py's docstring) and several of the hardest T=600s
-(and a couple of borderline T=30s) instances where the fixed
-30%-of-budget construction reservation isn't enough --
-see the handoff doc's "Known limitations" section.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import os
 import random
 import sys
 import time
 from typing import Optional
 
-import part_a
+try:
+    import part_a_random_restart as part_a
+except ImportError:
+    # When this file is copied to repo_root/part_b.py for benchmarking
+    # (see scripts/bench_experiment.sh), __file__'s own directory is the
+    # repo root, not experiments/ -- so also try repo_root/experiments
+    # (where part_a_random_restart.py itself is left untouched by the copy).
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (here, os.path.join(here, "experiments")):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+    import part_a_random_restart as part_a
 
 Shift = str
 Roster = list  # list[list[Shift]], roster[nurse][day]

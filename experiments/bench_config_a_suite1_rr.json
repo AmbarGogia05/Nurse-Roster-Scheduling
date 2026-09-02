@@ -1,0 +1,10 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_001",
+  "jobs": 10,
+  "cpus": 12,
+  "variants": {
+    "random_restart": "experiments/part_a_random_restart.py"
+  }
+}

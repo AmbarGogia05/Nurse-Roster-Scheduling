@@ -1,53 +1,34 @@
 #!/usr/bin/env python3
-"""Part A: nurse rostering as a constraint satisfaction problem.
+"""EXPERIMENTAL variant of part_a.py: randomized-restart + hybrid true-LCV,
+combined.
+
+Forked from part_a_random_restart.py; additionally applies
+part_a_hybrid_lcv.py's true-LCV fallback (for cells with few remaining
+candidates) on the deterministic first attempt, since hybrid-LCV alone
+independently fixed a known-hard case (suite_002/test22) that
+random-restart alone did not (see NOTES_experiment_results.md's individual
+benchmark results). Random-restart mode still ignores the scorer entirely
+per its own docstring below.
+
+EXPERIMENTAL variant of part_a.py: randomized-tiebreak restarts.
+
+Forked from the real part_a.py. Targets the "thrashing" failure mode
+identified in NOTES_correctness_and_approaches.md (test25: ~27,000 wasted
+backtrack calls on an 80-variable, 100%-slack instance with abundant
+solutions -- a bad deterministic tie-break, not fundamental hardness). If
+the deterministic first attempt (byte-identical to part_a.py) times out
+without a conclusion, falls back to randomized-tiebreak restarts with
+short time slices carved from the remaining budget (L05: random restarts).
+See select_unassigned_variable, order_domain_values, and solve below for
+the specific changes.
+
+Part A: nurse rostering as a constraint satisfaction problem.
 
 The intended CSP model is:
 
     variable:       (nurse, day)
     value/domain:   one of M, A, E, R, B
     assignment:     roster[nurse][day]
-
-Solved via CSP backtracking search: MRV variable ordering (O(1) via
-domain-size buckets), a heuristic value-ordering scorer, and incremental
-forward checking that enforces H2/H3/H4/H5/H6/H7/H8 proactively.
-
-Three additional techniques on top of that base search, all validated via
-the Dockerized checker against checker/test-cases (see
-HANDOFF_experiments_llm.md and NOTES_competitive_optimization.md for the
-full benchmark numbers and derivations):
-
-  1. Randomized-restart fallback (select_unassigned_variable,
-     order_domain_values, solve). The deterministic heuristic-guided first
-     attempt is unchanged from the original solver, so already-fast
-     instances are unaffected. If it times out without a conclusion
-     (SearchTimeout, not a definite True/False), the search falls back to
-     short time-sliced restarts with UNIFORMLY RANDOM value ordering
-     (deliberately ignoring the heuristic scorer -- empirically, the
-     heuristic was found to actively mislead search on some instances; see
-     the handoff doc for the concrete case study). A restart's backtrack()
-     completing without hitting its own slice deadline is still a valid
-     proof of infeasibility regardless of tie-break order, since
-     forward-checking pruning never removes a genuine solution -- so this
-     can only help performance, never soundness.
-  2. Batched candidate-set updates (remove_values, restore_domains).
-     update_coverage_candidates is called once per cell actually touched
-     rather than once per individual domain value removed/restored, since
-     it only depends on the final domain state. Pure speed, no behavioral
-     change.
-  3. A tighter, leave-aware necessary-infeasibility bound
-     (basic_feasibility_checks). Replaces the naive N*K global capacity
-     bound with a per-nurse cap of min(K, per_day_cap * (D - that nurse's
-     leave-day count)), where per_day_cap is 2 for surgical nurses (a B
-     shift consumes 2 load-units in one day) and 1 for general nurses.
-     Strictly tighter than, never looser than, the original bound, so it
-     can only detect more true-infeasible instances faster, never produce
-     a false positive.
-
-Benchmark summary (full detail in HANDOFF_experiments_llm.md): 1017/1024
-PASS (99.3%) across the combined suite_001 (1000 cases) + suite_002 (24
-cases) checker suites, vs. 953/1024 (93.1%) for the prior implementation,
-with zero regressions (every remaining failure was already failing before)
-and 43% less total checker wall time.
 """
 
 from __future__ import annotations
@@ -60,7 +41,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-# Module-level RNG, None in deterministic mode (matches the original
+# EXPERIMENTAL: module-level RNG, None in deterministic mode (matches the
 # real part_a.py exactly), set to a seeded Random() during randomized
 # restart attempts. Module-level rather than threaded through every call
 # to keep this experiment's diff against part_a.py minimal and localized.
@@ -282,20 +263,13 @@ def update_coverage_candidates(
 
 
 def basic_feasibility_checks(p: Problem) -> bool:
-    """Leave-aware global capacity bound (derivation and a validated
-    experiments/part_a_matching_prune.py for the full derivation and a
-    validated counter-example). Strictly tighter than, never looser than,
-    the original N*K bound."""
     leaves_count = [0] * p.D
     surgical_leaves_count = [0] * p.D
-    nurse_leave_count = [0] * p.N
     for i in range(p.N * p.D):
         if p.leaves[i] == "L":
-            nurse, day = divmod(i, p.D)
-            leaves_count[day] += 1
-            nurse_leave_count[nurse] += 1
-            if nurse < p.Ns:
-                surgical_leaves_count[day] += 1
+            leaves_count[i % p.D] += 1
+            if i // p.D < p.Ns:
+                surgical_leaves_count[i % p.D] += 1
 
     daily_requirement = p.morning_required + p.afternoon_required + p.evening_required
     for day in range(p.D):
@@ -318,13 +292,7 @@ def basic_feasibility_checks(p: Problem) -> bool:
         p.Ns == 0 or p.morning_required == 0 or p.afternoon_required == 0
     ):
         return False
-
-    total_capacity = 0
-    for nurse in range(p.N):
-        available_days = p.D - nurse_leave_count[nurse]
-        per_day_cap = 2 if p.is_surgical_nurse(nurse) else 1
-        total_capacity += min(p.max_shifts, per_day_cap * available_days)
-    if total_capacity < daily_requirement * p.D:
+    elif p.N * p.max_shifts < daily_requirement * p.D:
         return False
     return True
 
@@ -334,7 +302,7 @@ def select_unassigned_variable(
 ) -> Optional[Variable]:
     """Choose an unassigned cell using minimum remaining values.
 
-    When _RNG is set (randomized-restart mode), break MRV
+    EXPERIMENTAL: when _RNG is set (randomized-restart mode), break MRV
     ties randomly instead of by arbitrary set-iteration order, so repeated
     restarts explore genuinely different regions of the search tree.
     """
@@ -419,6 +387,29 @@ def score_domain_value(
     return score
 
 
+LCV_CANDIDATE_THRESHOLD = 3
+
+
+def true_lcv_score(
+    problem: Problem,
+    state: SearchState,
+    nurse: int,
+    day: int,
+    shift: Shift,
+) -> int:
+    """Speculatively assign+forward-check a value and count domain removals
+    (true LCV cost). See experiments/part_a_hybrid_lcv.py."""
+    assign(state, nurse, day, shift)
+    changes = forward_check(problem, state, nurse, day, shift)
+    if changes is None:
+        cost = 10**6
+    else:
+        cost = len(changes)
+        restore_domains(state, changes)
+    unassign(state, nurse, day, shift)
+    return cost
+
+
 def order_domain_values(
     problem: Problem,
     state: SearchState,
@@ -428,7 +419,7 @@ def order_domain_values(
 ) -> list[Shift]:
     """Order consistent values using the supplied estimated-cost function.
 
-    In randomized-restart mode (_RNG set), IGNORE the
+    EXPERIMENTAL: in randomized-restart mode (_RNG set), IGNORE the
     heuristic scorer entirely and use a uniformly random order instead of
     a randomized tiebreak on top of it. Empirically (see the `test25`
     thrashing case in NOTES_correctness_and_approaches.md /
@@ -456,10 +447,16 @@ def order_domain_values(
         _RNG.shuffle(shuffled)
         return shuffled
 
-    scored_values = [
-        (scorer(problem, state, nurse, day, shift), order, shift)
-        for order, shift in enumerate(consistent_values)
-    ]
+    if len(consistent_values) <= LCV_CANDIDATE_THRESHOLD:
+        scored_values = [
+            (true_lcv_score(problem, state, nurse, day, shift), order, shift)
+            for order, shift in enumerate(consistent_values)
+        ]
+    else:
+        scored_values = [
+            (scorer(problem, state, nurse, day, shift), order, shift)
+            for order, shift in enumerate(consistent_values)
+        ]
     scored_values.sort()
     return [shift for _, _, shift in scored_values]
 
@@ -589,24 +586,18 @@ def forward_check(
     dirty_days = {day}
 
     def remove_values(target_nurse: int, target_day: int, values: set[Shift]) -> None:
-        """Batch update_coverage_candidates to once per cell
-        touched (see experiments/part_a_lazy_candidates.py)."""
         if state.roster[target_nurse][target_day] is not None:
             return
-        domain = state.domains[target_nurse][target_day]
-        cell = (target_nurse, target_day)
-        removed_any = False
         for value in values:
-            if value in domain:
-                old_size = len(domain)
+            if value in state.domains[target_nurse][target_day]:
+                old_size = len(state.domains[target_nurse][target_day])
+                cell = (target_nurse, target_day)
                 state.domain_buckets[old_size].remove(cell)
-                domain.remove(value)
+                state.domains[target_nurse][target_day].remove(value)
                 state.domain_buckets[old_size - 1].add(cell)
+                update_coverage_candidates(state, target_nurse, target_day)
                 changes.append((target_nurse, target_day, value))
-                removed_any = True
-        if removed_any:
-            dirty_days.add(target_day)
-            update_coverage_candidates(state, target_nurse, target_day)
+                dirty_days.add(target_day)
 
     # H2, H3, H6: prune the previous and next day for this nurse.
     if day > 0:
@@ -723,19 +714,13 @@ def forward_check(
 
 
 def restore_domains(state: SearchState, changes: list[DomainChange]) -> None:
-    """Undo domain removals in reverse order.
-
-    Defer update_coverage_candidates to once per unique cell
-    touched (see experiments/part_a_lazy_candidates.py)."""
-    touched_cells: set[Variable] = set()
+    """Undo domain removals in reverse order."""
     for nurse, day, shift in reversed(changes):
         old_size = len(state.domains[nurse][day])
         cell = (nurse, day)
         state.domain_buckets[old_size].remove(cell)
         state.domains[nurse][day].add(shift)
         state.domain_buckets[old_size + 1].add(cell)
-        touched_cells.add(cell)
-    for nurse, day in touched_cells:
         update_coverage_candidates(state, nurse, day)
 
 
@@ -788,7 +773,7 @@ def backtrack(problem: Problem, state: SearchState, deadline: float) -> bool:
 def solve(problem: Problem) -> Optional[list[list[Shift]]]:
     """Return a valid N-by-D roster, or None if none is found in time.
 
-    After a deterministic first attempt (identical to the
+    EXPERIMENTAL: after a deterministic first attempt (identical to the
     real part_a.py, so already-fast cases are unaffected), fall back to
     randomized-tiebreak restarts with the remaining time budget if that
     attempt times out without a definite conclusion (L05: random restarts).

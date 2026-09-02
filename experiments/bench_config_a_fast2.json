@@ -1,0 +1,11 @@
+{
+  "target": "part_a.py",
+  "part": "a",
+  "tests": "suite_002",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "lazy_candidates": "experiments/part_a_lazy_candidates.py",
+    "matching_prune": "experiments/part_a_matching_prune.py"
+  }
+}

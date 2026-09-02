@@ -1,0 +1,10 @@
+{
+  "target": "part_b.py",
+  "part": "b",
+  "tests": "suite_002,suite_003,suite_004",
+  "jobs": 8,
+  "cpus": 10,
+  "variants": {
+    "hillclimb_v2": "experiments/part_b_hillclimb_v2.py"
+  }
+}

@@ -1,0 +1,19 @@
+# Sandbox image for running checker/check.py against untrusted submission code
+# (part_a.py / part_b.py) without network access.
+#
+# The repo is NOT copied into the image; it is bind-mounted read-only at
+# `docker run` time (see scripts/run_checker.sh), so this image is generic
+# and reusable without rebuilding whenever part_a.py/part_b.py change.
+
+FROM python:3.10-slim
+
+# Non-root user: defense-in-depth on top of --network none / --read-only,
+# since checker/ ultimately executes untrusted student code as a subprocess.
+RUN useradd --create-home --uid 1000 runner
+
+WORKDIR /work
+USER runner
+
+# No ENTRYPOINT/CMD baked in: the actual checker invocation is supplied at
+# `docker run` time so this image serves both quick single-suite runs and
+# full sweeps.
